@@ -1,0 +1,13 @@
+.env
+tokens.json
+tokens.*.tmp
+*.duckdb
+*.duckdb.wal
+__pycache__/
+.venv/
+tokens.lock
+sync.lock
+app_pin.txt
+app_secret.txt
+app.log
+app.log.1

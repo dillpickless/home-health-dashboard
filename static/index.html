@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Ring">
+  <meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-180.png">
+  <link rel="stylesheet" href="/style.css">
+  <title>Ring</title>
+</head>
+<body>
+  <main id="login" class="login" hidden>
+    <h1>Ring</h1>
+    <p class="muted">Enter the PIN to see the dashboard.</p>
+    <form id="login-form">
+      <input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="12"
+             placeholder="PIN" aria-label="PIN" required>
+      <button type="submit">Unlock</button>
+    </form>
+    <p id="login-error" class="error" role="alert"></p>
+  </main>
+
+  <div id="app" hidden>
+    <header class="top">
+      <h1 id="title">Today</h1>
+      <button id="sync-btn" class="ghost" aria-label="Sync now">Sync</button>
+    </header>
+    <p id="sync-line" class="muted small"></p>
+
+    <section id="tab-today" class="tab"></section>
+    <section id="tab-cycle" class="tab" hidden></section>
+    <section id="tab-trends" class="tab" hidden></section>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="today" aria-selected="true"><span aria-hidden="true">☀️</span>Today</button>
+      <button role="tab" data-tab="cycle" aria-selected="false"><span aria-hidden="true">🌙</span>Cycle</button>
+      <button role="tab" data-tab="trends" aria-selected="false"><span aria-hidden="true">📈</span>Trends</button>
+    </nav>
+  </div>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
