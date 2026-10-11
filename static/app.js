@@ -1,7 +1,11 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, tab: "today", range: 30, calMonth: null, selectedDay: null };
+const state = {
+  data: null, tab: "today", range: 30, calMonth: null, selectedDay: null,
+  // Oura reports temperature as a change from her baseline in °C; show °F in the US like the Oura app.
+  tempUnit: localStorage.getItem("tempUnit") || (navigator.language === "en-US" ? "F" : "C"),
+};
 
 const RISK = {
   high: { icon: "!", title: "Likely fertile", text: "Highest chance of pregnancy. Use protection." },
@@ -37,7 +41,22 @@ const parseDay = (s) => { const [y, m, d] = s.split("-").map(Number); return new
 const isoDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 const fmtDay = (s, opts = { month: "short", day: "numeric" }) => parseDay(s).toLocaleDateString(undefined, opts);
 const fmtNum = (v, digits = 0) => v === null || v === undefined ? "–" : Number(v).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
-const fmtTemp = (v) => v === null || v === undefined ? "–" : `${v > 0 ? "+" : ""}${v.toFixed(2)} °C`;
+// A temperature *difference* converts by ×1.8 only; the +32 offset applies to absolute temperatures.
+const toUnit = (c) => c === null || c === undefined ? null : state.tempUnit === "F" ? c * 1.8 : c;
+const fmtTempU = (v) => {
+  if (v === null || v === undefined) return "–";
+  const r = Math.round(v * 10) / 10;
+  return `${r > 0 ? "+" : r < 0 ? "−" : ""}${Math.abs(r).toFixed(1)} °${state.tempUnit}`;
+};
+const fmtTemp = (c) => fmtTempU(toUnit(c));
+
+function unitToggle() {
+  return el("div", { class: "seg seg-small", role: "group", "aria-label": "Temperature unit" },
+    ...["F", "C"].map((u) => el("button", {
+      "aria-pressed": String(state.tempUnit === u),
+      onclick: () => { state.tempUnit = u; localStorage.setItem("tempUnit", u); render(); },
+    }, `°${u}`)));
+}
 const fmtHours = (h) => h === null || h === undefined ? "–" : `${Math.floor(h)}h ${String(Math.round((h % 1) * 60)).padStart(2, "0")}m`;
 
 async function api(path, body) {
@@ -173,7 +192,7 @@ function renderToday() {
     tile("Time asleep", fmtHours(latest.sleep_hours), "", deltaLine(latest.sleep_hours, b.sleep_hours, { unit: "h", digits: 1, higherIsGood: true })),
     tile("HRV", fmtNum(latest.hrv), "ms", deltaLine(latest.hrv, b.hrv, { unit: " ms", higherIsGood: true })),
     tile("Resting HR", fmtNum(latest.rhr), "bpm", deltaLine(latest.rhr, b.rhr, { unit: " bpm", higherIsGood: false })),
-    tile("Body temp", fmtTemp(latest.temp), "", el("div", { class: "delta" }, "vs her baseline")),
+    tile("Body temp", fmtTemp(latest.temp), "", el("div", { class: "delta" }, "vs her normal")),
     tile("Steps", fmtNum(latest.steps), "", deltaLine(latest.steps, b.steps, { unit: "", higherIsGood: true }))));
 
   if (latest.stress) root.append(el("div", { class: "card" }, el("div", { class: "label" }, "Daytime stress"),
@@ -191,7 +210,7 @@ function renderCycle() {
 
   root.append(riskCard(selected, { big: true }));
   const trend = state.data.trends.find((t) => t.day === selected.day);
-  if (trend && trend.temp !== null) root.lastChild.append(el("p", { class: "small muted", style: "margin:8px 0 0" }, `Body temp ${fmtTemp(trend.temp)} vs her baseline`));
+  if (trend && trend.temp !== null) root.lastChild.append(el("p", { class: "small muted", style: "margin:8px 0 0" }, `Body temp ${fmtTemp(trend.temp)} vs her normal`));
 
   for (const note of c.notes) root.append(el("div", { class: "card banner" }, el("p", { style: "margin:0" }, note)));
 
@@ -238,9 +257,10 @@ function renderCycle() {
 
   // Temperature chart
   root.append(el("div", { class: "card" },
-    el("div", { class: "chart-head" }, el("h2", {}, "Body temperature"), el("span", { class: "label" }, "°C vs her baseline")),
+    el("div", { class: "chart-head" }, el("h2", {}, "Body temperature"), unitToggle()),
     el("div", { id: "temp-chart" }),
-    el("p", { class: "small muted", style: "margin:6px 0 0" }, "After ovulation her temperature rises and stays up until her period. That rise is what confirms the low-risk phase.")));
+    el("p", { class: "small muted", style: "margin:6px 0 0" }, "After ovulation her temperature rises and stays up until her period. That rise is what confirms the low-risk phase."),
+    el("p", { class: "small muted", style: "margin:6px 0 0" }, "Oura shares how far her temperature is from her own normal, not a thermometer reading. The shape of the line is what matters.")));
 
   // Period logging
   const dateInput = el("input", { type: "date", max: state.data.today, value: state.data.today, "aria-label": "Period start date" });
@@ -271,12 +291,12 @@ function renderTempChart() {
   const host = $("#temp-chart");
   if (!host || $("#tab-cycle").hidden) return;
   const c = state.data.cycle;
-  const points = state.data.trends.slice(-60).map((t) => ({ day: t.day, value: t.temp }));
+  const points = state.data.trends.slice(-60).map((t) => ({ day: t.day, value: toUnit(t.temp) }));
   const markers = [
     ...c.periods.map((d) => ({ day: d, label: "🩸" })),
     ...c.cycles.filter((x) => x.ovulation).map((x) => ({ day: x.ovulation, label: "🥚" })),
   ];
-  lineChart(host, points, { format: fmtTemp, ref: { value: 0, label: "baseline" }, markers, title: "Body temperature" });
+  lineChart(host, points, { format: fmtTempU, ref: { value: 0, label: "her normal" }, markers, title: "Body temperature" });
 }
 
 // ------------------------------------------------------------------ trends
@@ -287,7 +307,7 @@ const METRICS = [
   { key: "hrv", title: "HRV", unit: "ms", fmt: (v) => `${fmtNum(v)} ms`, base: "hrv" },
   { key: "rhr", title: "Resting heart rate", unit: "bpm", fmt: (v) => `${fmtNum(v)} bpm`, base: "rhr" },
   { key: "sleep_hours", title: "Time asleep", fmt: fmtHours, base: "sleep_hours" },
-  { key: "temp", title: "Body temperature", unit: "°C vs baseline", fmt: fmtTemp, ref0: true },
+  { key: "temp", title: "Body temperature", fmt: fmtTempU, scale: toUnit, ref0: true, toggle: true },
   { key: "steps", title: "Steps", fmt: (v) => fmtNum(v), bars: true },
 ];
 
@@ -304,17 +324,18 @@ function renderTrends() {
     return;
   }
   for (const m of METRICS) {
-    const points = rows.map((r) => ({ day: r.day, value: r[m.key] }));
+    const points = rows.map((r) => ({ day: r.day, value: m.scale ? m.scale(r[m.key]) : r[m.key] }));
     const valid = points.filter((p) => p.value !== null);
     const last = valid[valid.length - 1];
     const host = el("div");
     root.append(el("div", { class: "card" },
       el("div", { class: "chart-head" }, el("h2", {}, m.title), el("span", { class: "now" }, last ? m.fmt(last.value) : "–")),
+      m.toggle ? unitToggle() : null,
       host,
       valid.length ? el("details", {}, el("summary", {}, "Show numbers"),
         el("table", {}, el("tbody", {}, ...valid.slice().reverse().map((p) => el("tr", {}, el("td", {}, fmtDay(p.day, { weekday: "short", month: "short", day: "numeric" })), el("td", {}, m.fmt(p.value))))))) : null));
     const base = m.base && state.data.baselines[m.base];
-    const ref = m.ref0 ? { value: 0, label: "baseline" } : base && base.ready ? { value: base.median, label: "her normal" } : null;
+    const ref = m.ref0 ? { value: 0, label: "her normal" } : base && base.ready ? { value: base.median, label: "her normal" } : null;
     (m.bars ? barChart : lineChart)(host, points, { format: m.fmt, ref, title: m.title });
   }
 }

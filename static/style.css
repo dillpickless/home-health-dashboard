@@ -132,6 +132,8 @@ details td, details th { text-align: left; padding: 3px 0; border-top: 1px solid
 
 .seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 2px; margin-bottom: 12px; }
 .seg button { background: transparent; color: var(--ink-2); padding: 6px 14px; border-radius: 8px; font-weight: 500; }
+.seg-small { margin: 0; }
+.seg-small button { padding: 3px 10px; font-size: 13px; }
 .seg button[aria-pressed="true"] { background: var(--page); color: var(--ink); font-weight: 600; }
 
 .tabs {
