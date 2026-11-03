@@ -11,3 +11,4 @@ app_pin.txt
 app_secret.txt
 app.log
 app.log.1
+oura.duckdb.tmp/

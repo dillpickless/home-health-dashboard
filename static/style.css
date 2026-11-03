@@ -153,3 +153,20 @@ details td, details th { text-align: left; padding: 3px 0; border-top: 1px solid
   font-size: 13px; padding: 6px 10px; border-radius: 8px; white-space: nowrap;
 }
 .empty { text-align: center; padding: 24px 16px; color: var(--ink-2); }
+
+.tappable { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.tappable:active { transform: scale(0.98); }
+.info { float: right; color: var(--muted); font-size: 14px; margin-left: 6px; }
+.summary p { margin: 0 0 8px; line-height: 1.45; }
+.summary p:last-child { margin-bottom: 0; }
+.sheet {
+  border: 0; border-radius: 20px 20px 0 0; margin: auto 0 0; width: 100%; max-width: 100%;
+  background: var(--surface); color: var(--ink);
+  padding: 20px 20px calc(20px + env(safe-area-inset-bottom));
+}
+.sheet::backdrop { background: rgba(0, 0, 0, 0.45); }
+.sheet h2 { font-size: 20px; }
+.sheet h3 { font-size: 14px; margin: 14px 0 4px; color: var(--ink-2); }
+.sheet p { margin: 0 0 6px; line-height: 1.45; }
+.sheet .normal { font-weight: 600; margin-top: 10px; }
+.sheet button { width: 100%; margin-top: 14px; }

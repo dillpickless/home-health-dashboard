@@ -3,8 +3,8 @@
 const $ = (sel) => document.querySelector(sel);
 const state = {
   data: null, tab: "today", range: 30, calMonth: null, selectedDay: null,
-  // Oura reports temperature as a change from her baseline in °C; show °F in the US like the Oura app.
-  tempUnit: localStorage.getItem("tempUnit") || (navigator.language === "en-US" ? "F" : "C"),
+  // Oura reports temperature as a change from her baseline in °C; show °F like her Oura app.
+  tempUnit: localStorage.getItem("tempUnit") || "F",
 };
 
 const RISK = {
@@ -49,6 +49,22 @@ const fmtTempU = (v) => {
   return `${r > 0 ? "+" : r < 0 ? "−" : ""}${Math.abs(r).toFixed(1)} °${state.tempUnit}`;
 };
 const fmtTemp = (c) => fmtTempU(toUnit(c));
+// Absolute temperatures (estimated from thermometer calibration) do use the +32.
+const toUnitAbs = (c) => c === null || c === undefined ? null : state.tempUnit === "F" ? c * 1.8 + 32 : c;
+const fmtAbsU = (v) => v === null || v === undefined ? "–" : `≈ ${v.toFixed(1)} °${state.tempUnit}`;
+const calibrated = () => state.data.temperature.calibration.ready;
+
+// Chart series for body temperature: estimated actual temps once calibrated, else change from her normal.
+function tempSeries(rows) {
+  if (calibrated()) {
+    return {
+      points: rows.map((r) => ({ day: r.day, value: toUnitAbs(r.temp_est) })),
+      format: fmtAbsU,
+      ref: { value: toUnitAbs(state.data.temperature.calibration.baseline_c), label: "her normal" },
+    };
+  }
+  return { points: rows.map((r) => ({ day: r.day, value: toUnit(r.temp) })), format: fmtTempU, ref: { value: 0, label: "her normal" } };
+}
 
 function unitToggle() {
   return el("div", { class: "seg seg-small", role: "group", "aria-label": "Temperature unit" },
@@ -88,7 +104,10 @@ async function boot() {
 }
 
 async function load() {
-  state.data = await api("/api/dashboard");
+  const data = await api("/api/dashboard");
+  // iOS keeps home-screen apps in memory, so pick up new app code once the server has it.
+  if (state.data && data.version !== state.data.version) { location.reload(); return; }
+  state.data = data;
   $("#login").hidden = true;
   $("#app").hidden = false;
   if (!state.calMonth) { const t = parseDay(state.data.today); state.calMonth = new Date(t.getFullYear(), t.getMonth(), 1); }
@@ -148,55 +167,133 @@ function deltaLine(value, base, { unit, digits = 0, higherIsGood }) {
   return el("div", { class: `delta ${good ? "good" : ""}` }, `${arrow} ${fmtNum(Math.abs(diff), digits)}${unit} vs her normal`);
 }
 
-function tile(label, value, unit, delta) {
-  return el("div", { class: "card" },
-    el("div", { class: "label" }, label),
+// Plain-English explanations shown when she taps a number.
+const EXPLAIN = {
+  readiness: { title: "Readiness",
+    what: "Oura's 0–100 score for how recovered her body is, built from last night's sleep, heart rate, HRV, temperature and recent activity.",
+    good: "85+ is great, 70–84 is good, under 70 means take it easier today.",
+    moves: "Short or late sleep, alcohol, illness and hard workouts lower it. It also tends to dip a little after ovulation." },
+  sleep_score: { title: "Sleep score",
+    what: "A 0–100 score for last night's sleep: how long, how deep, how restful, and how well timed it was.",
+    good: "85+ is great, 70–84 is good.",
+    moves: "Regular bedtimes, a cool dark room, and no late caffeine or alcohol help most." },
+  sleep_hours: { title: "Time asleep",
+    what: "Actual time asleep, not time in bed.",
+    good: "Most adults need 7–9 hours. Her own normal matters more than the general rule.",
+    moves: "Late nights, waking up during the night, and the days before her period can all cut it short." },
+  hrv: { title: "HRV (heart rate variability)",
+    what: "Tiny differences in timing between heartbeats. Higher usually means her body is relaxed and recovered.",
+    good: "It's very personal, so only compare it to her own normal, never to other people.",
+    moves: "Drops with stress, alcohol, illness, poor sleep and hard training. It naturally dips after ovulation too." },
+  rhr: { title: "Resting heart rate",
+    what: "Her lowest heart rate while asleep. Lower generally means a more rested heart.",
+    good: "A few beats either side of her normal is everyday noise.",
+    moves: "A jump of several beats can mean illness, stress, a late meal or a drink. It rises a little after ovulation, which is normal." },
+  temp: { title: "Body temperature",
+    what: "How far her skin temperature last night was from her own normal. The '≈' number, once it appears, is an estimate from her thermometer readings.",
+    good: "Small swings of about ±0.5 °F are everyday noise.",
+    moves: "A rise that holds for several nights after ovulation is the cycle signal. A sudden big jump can mean she's getting sick." },
+  steps: { title: "Steps",
+    what: "Steps counted by the ring today.",
+    good: "Moving regularly matters more than hitting an exact number.",
+    moves: "Walks, errands, and standing up every hour all add up." },
+  stress: { title: "Daytime stress",
+    what: "Oura's read on her stress while awake, from heart rate and HRV: restored, normal or stressful.",
+    good: "A stressful day isn't bad by itself. What matters is the balance with rest and recovery.",
+    moves: "Busy days, poor sleep, caffeine and illness push it up. Calm time and good sleep bring it down." },
+  risk: { title: "How the cycle colors work",
+    what: "Red means likely fertile (the days before and around ovulation). Yellow means fertility can't be ruled out yet. Green means ovulation was confirmed by her temperature, so it's the lowest-risk stretch until her next period.",
+    good: "Green only appears after her temperature has stayed up for 3 nights. Early on most days will be yellow while the app learns her cycle.",
+    moves: "This is an estimate, not birth control. Keep using condoms." },
+};
+
+const BASE_FMT = {
+  readiness: (v) => fmtNum(v), sleep_score: (v) => fmtNum(v), sleep_hours: fmtHours,
+  hrv: (v) => `${fmtNum(v)} ms`, rhr: (v) => `${fmtNum(v)} bpm`, steps: (v) => fmtNum(v),
+};
+
+function explain(key) {
+  const e = EXPLAIN[key];
+  const b = state.data.baselines[key];
+  let normal = null;
+  if (key === "temp" && calibrated()) normal = `Her normal: ${fmtAbsU(toUnitAbs(state.data.temperature.calibration.baseline_c)).slice(2)}`;
+  else if (b && b.ready && BASE_FMT[key]) normal = `Her normal: ${BASE_FMT[key](b.median)} (middle of the last ${b.nights} nights)`;
+  else if (b && BASE_FMT[key]) normal = `Still learning her normal (${b.nights}/14 nights)`;
+  const dialog = el("dialog", { class: "sheet", "aria-label": e.title },
+    el("h2", {}, e.title),
+    el("p", {}, e.what),
+    normal ? el("p", { class: "normal" }, normal) : null,
+    el("h3", {}, "What's good"), el("p", {}, e.good),
+    el("h3", {}, "What moves it"), el("p", {}, e.moves),
+    el("button", { onclick: () => dialog.close() }, "Got it"));
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.addEventListener("click", (ev) => { if (ev.target === dialog) dialog.close(); });  // tap outside
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+function tappable(key, node) {
+  node.classList.add("tappable");
+  node.setAttribute("role", "button");
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("aria-label", `${EXPLAIN[key].title}: what this means`);
+  node.addEventListener("click", () => explain(key));
+  node.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); explain(key); } });
+  return node;
+}
+
+function tile(key, label, value, unit, delta) {
+  return tappable(key, el("div", { class: "card" },
+    el("div", { class: "label" }, label, el("span", { class: "info", "aria-hidden": "true" }, "ⓘ")),
     el("div", { class: "tile-value" }, value, unit ? el("span", { class: "tile-unit" }, ` ${unit}`) : null),
-    delta);
+    delta));
 }
 
 function riskCard(entry, { big = false } = {}) {
   const r = RISK[entry.risk];
   const cd = entry.cycle_day ? `Cycle day ${entry.cycle_day} · ` : "";
-  return el("div", { class: "card" },
+  return tappable("risk", el("div", { class: "card" },
     el("div", { class: "status" },
       el("div", { class: `status-icon risk-${entry.risk}`, "aria-hidden": "true" }, r.icon),
-      el("div", {},
+      el("div", { style: "flex:1" },
         el("div", { class: "label" }, `${cd}${fmtDay(entry.day, { weekday: "long", month: "short", day: "numeric" })}`),
-        el("div", { class: "status-title" }, r.title))),
-    big ? el("p", { class: "muted", style: "margin:10px 0 0" }, r.text) : null);
+        el("div", { class: "status-title" }, r.title)),
+      el("span", { class: "info", "aria-hidden": "true" }, "ⓘ")),
+    big ? el("p", { class: "muted", style: "margin:10px 0 0" }, r.text) : null));
 }
 
 function renderToday() {
   const root = $("#tab-today");
   root.replaceChildren();
-  const { latest, baselines: b, strain, cycle } = state.data;
+  const { latest, baselines: b, strain, cycle, summary } = state.data;
 
   root.append(riskCard(cycle.today));
   if (strain) root.append(el("div", { class: "card banner" }, el("h2", {}, "Heads up"), el("p", { class: "muted", style: "margin:0" }, strain.text)));
+  root.append(el("div", { class: "card summary" },
+    el("h2", {}, "Today in plain English"),
+    ...summary.map((line) => el("p", {}, line))));
 
-  if (!latest) {
-    root.append(el("div", { class: "card empty" },
-      el("h2", {}, "Waiting for her first night"),
-      "Scores show up after she sleeps with the ring and opens the Oura app so it can upload."));
-    return;
-  }
+  if (!latest) return;
   const asOf = latest.day === state.data.today ? "Today" : fmtDay(latest.day, { weekday: "long" });
-  root.append(el("div", { class: "card" },
-    el("div", { class: "label" }, `Readiness · ${asOf}`),
+  root.append(tappable("readiness", el("div", { class: "card" },
+    el("div", { class: "label" }, `Readiness · ${asOf}`, el("span", { class: "info", "aria-hidden": "true" }, "ⓘ")),
     el("div", { class: "hero" }, fmtNum(latest.readiness)),
-    deltaLine(latest.readiness, b.readiness, { unit: "", higherIsGood: true })));
+    deltaLine(latest.readiness, b.readiness, { unit: "", higherIsGood: true }))));
 
   root.append(el("div", { class: "tiles" },
-    tile("Sleep score", fmtNum(latest.sleep_score), "", deltaLine(latest.sleep_score, b.sleep_score, { unit: "", higherIsGood: true })),
-    tile("Time asleep", fmtHours(latest.sleep_hours), "", deltaLine(latest.sleep_hours, b.sleep_hours, { unit: "h", digits: 1, higherIsGood: true })),
-    tile("HRV", fmtNum(latest.hrv), "ms", deltaLine(latest.hrv, b.hrv, { unit: " ms", higherIsGood: true })),
-    tile("Resting HR", fmtNum(latest.rhr), "bpm", deltaLine(latest.rhr, b.rhr, { unit: " bpm", higherIsGood: false })),
-    tile("Body temp", fmtTemp(latest.temp), "", el("div", { class: "delta" }, "vs her normal")),
-    tile("Steps", fmtNum(latest.steps), "", deltaLine(latest.steps, b.steps, { unit: "", higherIsGood: true }))));
+    tile("sleep_score", "Sleep score", fmtNum(latest.sleep_score), "", deltaLine(latest.sleep_score, b.sleep_score, { unit: "", higherIsGood: true })),
+    tile("sleep_hours", "Time asleep", fmtHours(latest.sleep_hours), "", deltaLine(latest.sleep_hours, b.sleep_hours, { unit: "h", digits: 1, higherIsGood: true })),
+    tile("hrv", "HRV", fmtNum(latest.hrv), "ms", deltaLine(latest.hrv, b.hrv, { unit: " ms", higherIsGood: true })),
+    tile("rhr", "Resting HR", fmtNum(latest.rhr), "bpm", deltaLine(latest.rhr, b.rhr, { unit: " bpm", higherIsGood: false })),
+    calibrated() && latest.temp_est !== null
+      ? tile("temp", "Body temp", fmtAbsU(toUnitAbs(latest.temp_est)), "", el("div", { class: "delta" }, `${fmtTemp(latest.temp)} vs her normal`))
+      : tile("temp", "Body temp", fmtTemp(latest.temp), "", el("div", { class: "delta" }, "vs her normal")),
+    tile("steps", "Steps", fmtNum(latest.steps), "", deltaLine(latest.steps, b.steps, { unit: "", higherIsGood: true }))));
 
-  if (latest.stress) root.append(el("div", { class: "card" }, el("div", { class: "label" }, "Daytime stress"),
-    el("div", { class: "tile-value" }, latest.stress[0].toUpperCase() + latest.stress.slice(1))));
+  if (latest.stress) root.append(tappable("stress", el("div", { class: "card" },
+    el("div", { class: "label" }, "Daytime stress", el("span", { class: "info", "aria-hidden": "true" }, "ⓘ")),
+    el("div", { class: "tile-value" }, latest.stress[0].toUpperCase() + latest.stress.slice(1)))));
+  root.append(el("p", { class: "small muted", style: "text-align:center" }, "Tap any card to see what it means."));
 }
 
 // ------------------------------------------------------------------ cycle
@@ -210,7 +307,9 @@ function renderCycle() {
 
   root.append(riskCard(selected, { big: true }));
   const trend = state.data.trends.find((t) => t.day === selected.day);
-  if (trend && trend.temp !== null) root.lastChild.append(el("p", { class: "small muted", style: "margin:8px 0 0" }, `Body temp ${fmtTemp(trend.temp)} vs her normal`));
+  if (trend && trend.temp !== null) root.lastChild.append(el("p", { class: "small muted", style: "margin:8px 0 0" }, calibrated() && trend.temp_est !== null
+    ? `Body temp ${fmtAbsU(toUnitAbs(trend.temp_est))} (${fmtTemp(trend.temp)} vs her normal)`
+    : `Body temp ${fmtTemp(trend.temp)} vs her normal`));
 
   for (const note of c.notes) root.append(el("div", { class: "card banner" }, el("p", { style: "margin:0" }, note)));
 
@@ -260,7 +359,10 @@ function renderCycle() {
     el("div", { class: "chart-head" }, el("h2", {}, "Body temperature"), unitToggle()),
     el("div", { id: "temp-chart" }),
     el("p", { class: "small muted", style: "margin:6px 0 0" }, "After ovulation her temperature rises and stays up until her period. That rise is what confirms the low-risk phase."),
-    el("p", { class: "small muted", style: "margin:6px 0 0" }, "Oura shares how far her temperature is from her own normal, not a thermometer reading. The shape of the line is what matters.")));
+    el("p", { class: "small muted", style: "margin:6px 0 0" }, calibrated()
+      ? "Estimated from the ring's nightly change plus her thermometer readings. Close, but not exact."
+      : "Oura shares how far her temperature is from her own normal, not a thermometer reading. The shape of the line is what matters.")));
+  root.append(calibrationCard());
 
   // Period logging
   const dateInput = el("input", { type: "date", max: state.data.today, value: state.data.today, "aria-label": "Period start date" });
@@ -287,16 +389,51 @@ function renderCycle() {
     "This is an estimate from temperature, not birth control. Keep using condoms. For a certified option that uses her ring, see Natural Cycles."));
 }
 
+function calibrationCard() {
+  const t = state.data.temperature, cal = t.calibration, need = t.min_readings - cal.matched;
+  const unit = `°${state.tempUnit}`;
+  const status = cal.ready
+    ? `Her normal is about ${fmtAbsU(toUnitAbs(cal.baseline_c)).slice(2)}, from ${cal.matched} readings. Usually within ±${(toUnit(Math.max(cal.typical_error_c, 0.05))).toFixed(1)} ${unit}. More readings make it more accurate.`
+    : `Log ${need} more reading${need === 1 ? "" : "s"} to see her estimated actual temperature.`;
+  const tempInput = el("input", { type: "number", inputmode: "decimal", step: "0.01",
+    placeholder: state.tempUnit === "F" ? "e.g. 97.80" : "e.g. 36.55", "aria-label": `Thermometer reading in ${unit}` });
+  const dateInput = el("input", { type: "date", max: state.data.today, value: state.data.today, "aria-label": "Day she woke up" });
+  const msg = el("p", { class: "error small", role: "alert" });
+  const save = async () => {
+    const v = parseFloat(tempInput.value);
+    if (Number.isNaN(v)) { msg.textContent = "Enter the thermometer reading."; return; }
+    const tempC = state.tempUnit === "F" ? (v - 32) / 1.8 : v;
+    try { await api("/api/reading", { day: dateInput.value, temp_c: tempC }); await load(); }
+    catch (err) { msg.textContent = err.message; }
+  };
+  const list = el("ul", { class: "period-list" }, ...t.readings.map((r) =>
+    el("li", {},
+      el("span", {}, `${fmtDay(r.day, { weekday: "short", month: "short", day: "numeric" })} · ${toUnitAbs(r.temp_c).toFixed(2)} ${unit}`,
+        r.deviation_c === null ? el("span", { class: "muted small" }, " · waiting for ring data") : null),
+      el("button", { class: "danger", onclick: async () => {
+        if (!confirm(`Remove the reading from ${fmtDay(r.day)}?`)) return;
+        await api("/api/reading/delete", { day: r.day }); await load();
+      } }, "Remove"))));
+  return el("div", { class: "card" },
+    el("h2", {}, "Actual temperature"),
+    el("p", { class: "small muted" }, status),
+    el("p", { class: "small muted" }, "Use a basal thermometer under the tongue right when she wakes from her main sleep, whatever time that is. Any days work; she doesn't need every morning."),
+    el("div", { class: "row" }, tempInput, el("span", { class: "muted" }, unit)),
+    el("div", { class: "row", style: "margin-top:8px" }, dateInput, el("button", { onclick: save }, "Save")),
+    msg,
+    t.readings.length ? list : null);
+}
+
 function renderTempChart() {
   const host = $("#temp-chart");
   if (!host || $("#tab-cycle").hidden) return;
   const c = state.data.cycle;
-  const points = state.data.trends.slice(-60).map((t) => ({ day: t.day, value: toUnit(t.temp) }));
+  const series = tempSeries(state.data.trends.slice(-60));
   const markers = [
     ...c.periods.map((d) => ({ day: d, label: "🩸" })),
     ...c.cycles.filter((x) => x.ovulation).map((x) => ({ day: x.ovulation, label: "🥚" })),
   ];
-  lineChart(host, points, { format: fmtTempU, ref: { value: 0, label: "her normal" }, markers, title: "Body temperature" });
+  lineChart(host, series.points, { format: series.format, ref: series.ref, markers, title: "Body temperature" });
 }
 
 // ------------------------------------------------------------------ trends
@@ -307,7 +444,7 @@ const METRICS = [
   { key: "hrv", title: "HRV", unit: "ms", fmt: (v) => `${fmtNum(v)} ms`, base: "hrv" },
   { key: "rhr", title: "Resting heart rate", unit: "bpm", fmt: (v) => `${fmtNum(v)} bpm`, base: "rhr" },
   { key: "sleep_hours", title: "Time asleep", fmt: fmtHours, base: "sleep_hours" },
-  { key: "temp", title: "Body temperature", fmt: fmtTempU, scale: toUnit, ref0: true, toggle: true },
+  { key: "temp", title: "Body temperature", temp: true, toggle: true },
   { key: "steps", title: "Steps", fmt: (v) => fmtNum(v), bars: true },
 ];
 
@@ -324,19 +461,21 @@ function renderTrends() {
     return;
   }
   for (const m of METRICS) {
-    const points = rows.map((r) => ({ day: r.day, value: m.scale ? m.scale(r[m.key]) : r[m.key] }));
+    const series = m.temp ? tempSeries(rows) : null;
+    const points = series ? series.points : rows.map((r) => ({ day: r.day, value: r[m.key] }));
+    const fmt = series ? series.format : m.fmt;
     const valid = points.filter((p) => p.value !== null);
     const last = valid[valid.length - 1];
     const host = el("div");
     root.append(el("div", { class: "card" },
-      el("div", { class: "chart-head" }, el("h2", {}, m.title), el("span", { class: "now" }, last ? m.fmt(last.value) : "–")),
+      el("div", { class: "chart-head" }, el("h2", {}, m.title), el("span", { class: "now" }, last ? fmt(last.value) : "–")),
       m.toggle ? unitToggle() : null,
       host,
       valid.length ? el("details", {}, el("summary", {}, "Show numbers"),
-        el("table", {}, el("tbody", {}, ...valid.slice().reverse().map((p) => el("tr", {}, el("td", {}, fmtDay(p.day, { weekday: "short", month: "short", day: "numeric" })), el("td", {}, m.fmt(p.value))))))) : null));
+        el("table", {}, el("tbody", {}, ...valid.slice().reverse().map((p) => el("tr", {}, el("td", {}, fmtDay(p.day, { weekday: "short", month: "short", day: "numeric" })), el("td", {}, fmt(p.value))))))) : null));
     const base = m.base && state.data.baselines[m.base];
-    const ref = m.ref0 ? { value: 0, label: "her normal" } : base && base.ready ? { value: base.median, label: "her normal" } : null;
-    (m.bars ? barChart : lineChart)(host, points, { format: m.fmt, ref, title: m.title });
+    const ref = series ? series.ref : base && base.ready ? { value: base.median, label: "her normal" } : null;
+    (m.bars ? barChart : lineChart)(host, points, { format: fmt, ref, title: m.title });
   }
 }
 

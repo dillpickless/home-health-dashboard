@@ -28,7 +28,9 @@ from pathlib import Path
 import duckdb
 
 import cycle
+import insights
 import oura_sync
+import temperature
 from oura_auth import ROOT
 
 STATIC_DIR = ROOT / "static"
@@ -41,6 +43,7 @@ MIN_BASELINE_NIGHTS = 14
 SESSION_MAX_AGE = 365 * 24 * 60 * 60
 MAX_FAILED_LOGINS = 10
 LOCKOUT_SECONDS = 600
+ALLOWED_PEERS = {"127.0.0.1", "100.90.87.10"}  # localhost + her phone's tailnet IP
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
@@ -98,6 +101,14 @@ class Store:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )"""
         )
+        # On-waking thermometer readings, used to estimate actual temperature.
+        self.con.execute(
+            """CREATE TABLE IF NOT EXISTS app.temp_reading (
+                day DATE PRIMARY KEY,
+                temp_c DOUBLE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"""
+        )
         self.write_lock = threading.Lock()
         self.sync_status = {"running": False, "last_finished": None, "error": None}
 
@@ -144,6 +155,24 @@ class Store:
     def delete_period(self, day: dt.date) -> None:
         with self.write_lock:
             self.cursor().execute("DELETE FROM app.period_log WHERE day = ?", [day])
+
+    # ---- thermometer readings
+
+    def add_reading(self, day: dt.date, temp_c: float) -> None:
+        with self.write_lock:
+            self.cursor().execute(
+                """INSERT INTO app.temp_reading (day, temp_c) VALUES (?, ?)
+                   ON CONFLICT (day) DO UPDATE SET temp_c = excluded.temp_c""",
+                [day, temp_c],
+            )
+
+    def delete_reading(self, day: dt.date) -> None:
+        with self.write_lock:
+            self.cursor().execute("DELETE FROM app.temp_reading WHERE day = ?", [day])
+
+    def readings(self) -> dict[dt.date, float]:
+        return dict(self.cursor().execute(
+            "SELECT day, temp_c FROM app.temp_reading ORDER BY day").fetchall())
 
     # ---- reads
 
@@ -221,22 +250,9 @@ def baselines(rows: list[dict], today: dt.date) -> dict:
     return out
 
 
-def strain_signal(latest: dict | None, base: dict) -> dict | None:
-    """Flag the classic 'getting sick or run down' pattern: RHR up, HRV down."""
-    if not latest or not (base["rhr"]["ready"] and base["hrv"]["ready"]):
-        return None
-    if latest["rhr"] is None or latest["hrv"] is None:
-        return None
-    rhr_up = latest["rhr"] - base["rhr"]["median"]
-    hrv_ratio = latest["hrv"] / base["hrv"]["median"] if base["hrv"]["median"] else 1
-    if rhr_up >= 3 and hrv_ratio <= 0.8:
-        return {
-            "level": "warning",
-            "text": f"Resting heart rate is {rhr_up:.0f} bpm above her normal and HRV is "
-                    f"{(1 - hrv_ratio) * 100:.0f}% below. Her body may be fighting something "
-                    "or under strain. Take it easy today.",
-        }
-    return None
+def static_version() -> str:
+    """Changes whenever a file in static/ changes, so open apps know to reload."""
+    return str(max(f.stat().st_mtime_ns for f in STATIC_DIR.iterdir() if f.is_file()))
 
 
 def build_dashboard(store: Store) -> dict:
@@ -250,6 +266,13 @@ def build_dashboard(store: Store) -> dict:
     periods = store.period_starts()
     cyc = cycle.classify(periods, temps, today, history_days=TREND_DAYS)
 
+    # Calibrate against the trend window only, so an old baseline ages out.
+    readings = store.readings()
+    cal = temperature.calibrate(readings, temps)
+    baseline_c = cal["baseline_c"] if cal["ready"] else None
+    for row in rows:
+        row["temp_est"] = temperature.estimate(baseline_c, row["temp"])
+
     def iso(value):
         return value.isoformat() if isinstance(value, dt.date) else value
 
@@ -257,16 +280,24 @@ def build_dashboard(store: Store) -> dict:
         return {k: iso(v) if k == "day" else (round(v, 2) if isinstance(v, float) else v)
                 for k, v in row.items()}
 
+    current = cyc["cycles"][-1] if cyc["cycles"] else None
+    today_entry = cyc["days"][today]
+    phase = insights.cycle_phase(today_entry, current, cyc["prediction"]["next_period"], today)
+
     prediction = dict(cyc["prediction"])
     prediction["next_period"] = iso(prediction["next_period"])
     if prediction["fertile_window"]:
         prediction["fertile_window"] = [iso(d) for d in prediction["fertile_window"]]
 
     return {
+        "version": static_version(),
         "today": today.isoformat(),
         "latest": clean(latest) if latest else None,
         "baselines": base,
-        "strain": strain_signal(latest, base),
+        "strain": insights.strain_signal(latest, base, phase),
+        "summary": insights.daily_summary(latest, base, phase, today_entry["cycle_day"]),
+        "phase": {"key": phase, "label": insights.PHASES[phase][0],
+                  "explainer": insights.PHASES[phase][1]} if phase else None,
         "trends": [clean(r) for r in rows],
         "cycle": {
             "today": {**cyc["days"][today], "day": today.isoformat()},
@@ -275,6 +306,12 @@ def build_dashboard(store: Store) -> dict:
             "prediction": prediction,
             "notes": cyc["notes"],
             "periods": [d.isoformat() for d in periods],
+        },
+        "temperature": {
+            "calibration": cal,
+            "min_readings": temperature.MIN_READINGS,
+            "readings": [{"day": d.isoformat(), "temp_c": t, "deviation_c": temps.get(d)}
+                         for d, t in sorted(readings.items(), reverse=True)],
         },
         "sync": {**store.sync_status, "endpoints": store.sync_state()},
     }
@@ -336,6 +373,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.guarded(self.route_post)
 
     def guarded(self, route) -> None:
+        if self.client_address[0] not in ALLOWED_PEERS:
+            return self.send_json(403, {"error": "forbidden"})
         try:
             route()
         except Exception:
@@ -375,6 +414,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json(400, {"error": "bad date"})
             self.store.delete_period(day)
             return self.send_json(200, {"ok": True})
+        if path == "/api/reading":
+            body = self.read_json()
+            day = self.parse_day(body.get("day"))
+            try:
+                temp_c = float(body.get("temp_c"))
+            except (TypeError, ValueError):
+                temp_c = None
+            lo, hi = temperature.VALID_RANGE_C
+            if not day or temp_c is None or not lo <= temp_c <= hi:
+                return self.send_json(400, {"error": "That reading looks off. Use a date that isn't "
+                                                     "in the future and a temperature between 95 and 104 °F."})
+            self.store.add_reading(day, temp_c)
+            return self.send_json(200, {"ok": True})
+        if path == "/api/reading/delete":
+            day = self.parse_day(self.read_json().get("day"))
+            if not day:
+                return self.send_json(400, {"error": "bad date"})
+            self.store.delete_reading(day)
+            return self.send_json(200, {"ok": True})
         if path == "/api/sync":
             self.store.sync_in_background()
             return self.send_json(202, {"ok": True})
@@ -398,7 +456,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Oura dashboard server")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="100.110.55.62")  # tailnet IP only
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-sync", action="store_true", help="don't sync in the background")
     args = parser.parse_args()
